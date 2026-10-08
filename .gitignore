@@ -1,0 +1,8 @@
+bin/
+keys.json
+config/keys.json
+videos/*.cenc
+incoming/*
+!incoming/.gitkeep
+*.tmp
+*.faststart.mp4
