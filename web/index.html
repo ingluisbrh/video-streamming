@@ -11,34 +11,82 @@
   button.active{background:#0a84ff;border-color:#0a84ff}
   video{width:100%;max-width:960px;background:#000;border-radius:12px}
   .size{color:#999;font-size:12px}
+  #lockbar{display:flex;gap:8px;align-items:center;margin:8px 0}
+  #unlock{max-width:420px;display:flex;flex-direction:column;gap:8px;margin-top:24px}
+  #unlock input{background:#222;color:#eee;border:1px solid #444;border-radius:8px;padding:10px;font-family:monospace}
+  #err{color:#ff7070;min-height:1.2em}
+  .hidden{display:none}
 </style>
 </head>
 <body>
-<h1>Private Stream <span class="size">(local only — key stays on server)</span></h1>
-<div id="list"></div>
-<video id="v" controls preload="metadata" playsinline></video>
+<h1>Private Stream <span class="size">(local only — key stays on server RAM)</span></h1>
+
+<div id="unlock" class="hidden">
+  <p>Server is locked. Paste the 64-hex-char master key to watch.</p>
+  <input id="key" type="password" placeholder="master key hex" autocomplete="off" spellcheck="false">
+  <button id="unlockBtn">Unlock</button>
+  <div id="err"></div>
+</div>
+
+<div id="app" class="hidden">
+  <div id="lockbar">
+    <button id="lockBtn">Lock</button>
+    <span class="size" id="idle"></span>
+  </div>
+  <div id="list"></div>
+  <video id="v" controls preload="metadata" playsinline></video>
+</div>
+
 <script>
-(async () => {
-  const list = document.getElementById('list'), v = document.getElementById('v');
-  const fmt = n => n > 1e9 ? (n/1e9).toFixed(2)+' GB' : Math.round(n/1e6)+' MB';
-  try {
-    const r = await fetch('/api/videos');
-    const items = await r.json();
-    if (!items.length) { list.textContent = 'No videos yet. Run ./scripts/add-video.sh file.mp4'; return; }
-    for (const it of items) {
-      const b = document.createElement('button');
-      b.textContent = `${it.name} (${fmt(it.size)})`;
-      b.onclick = () => {
-        document.querySelectorAll('button').forEach(x => x.classList.remove('active'));
-        b.classList.add('active');
-        v.src = '/video/' + encodeURIComponent(it.name);
-        v.play().catch(()=>{});
-      };
-      list.appendChild(b);
-    }
-    list.firstChild.click();
-  } catch (e) { list.textContent = 'Server error: ' + e; }
-})();
+const $ = id => document.getElementById(id);
+const fmt = n => n > 1e9 ? (n/1e9).toFixed(2)+' GB' : Math.round(n/1e6)+' MB';
+
+async function status() {
+  const r = await fetch('/api/status');
+  return r.json();
+}
+async function refresh() {
+  const st = await status();
+  $('unlock').classList.toggle('hidden', !st.locked);
+  $('app').classList.toggle('hidden', st.locked);
+  if (st.locked) return;
+  $('idle').textContent = st.idleLockMinutes > 0 ? `auto-locks after ${st.idleLockMinutes} min idle` : 'auto-lock off';
+  const r = await fetch('/api/videos');
+  if (r.status === 401) return refresh(); // locked meanwhile
+  const items = await r.json();
+  const list = $('list');
+  list.innerHTML = '';
+  if (!items.length) { list.textContent = 'No videos yet. Run ./scripts/add-video.sh file.mp4'; return; }
+  const v = $('v');
+  for (const it of items) {
+    const b = document.createElement('button');
+    b.textContent = `${it.name} (${fmt(it.size)})`;
+    b.onclick = () => {
+      document.querySelectorAll('#list button').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      v.src = '/video/' + encodeURIComponent(it.name);
+      v.play().catch(()=>{});
+    };
+    list.appendChild(b);
+  }
+}
+$('unlockBtn').onclick = async () => {
+  $('err').textContent = '';
+  const r = await fetch('/api/unlock', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({keyHex: $('key').value.trim()}),
+  });
+  if (!r.ok) { $('err').textContent = (await r.json()).error || 'unlock failed'; return; }
+  $('key').value = '';
+  refresh();
+};
+$('key').addEventListener('keydown', e => { if (e.key === 'Enter') $('unlockBtn').click(); });
+$('lockBtn').onclick = async () => {
+  await fetch('/api/lock', {method: 'POST'});
+  $('v').removeAttribute('src'); $('v').load();
+  refresh();
+};
+refresh();
 </script>
 </body>
 </html>

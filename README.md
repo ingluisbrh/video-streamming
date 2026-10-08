@@ -20,6 +20,15 @@ Key never leaves the server. Browser only sees `http://127.0.0.1:8080/video/<nam
 
 New files appear on page refresh — no restart, no DB. Delete = `rm videos/x.cenc`.
 
+## Key handling: unlock on watch
+
+- Default: key loads from `keys.json` at startup, no login needed.
+- `LOCKED=1 ./scripts/run.sh` (or no `keys.json` at all): server boots
+  **locked**. Open the page, paste the 64-hex-char master key, watch.
+  Key lives only in server RAM — Lock button or 30 min idle wipes it
+  (`--idle-lock 0` disables auto-lock).
+- A pasted key is checked against the library on unlock (typo → `401`).
+
 ## Notes
 
 - If a video buffers instead of starting fast, its `moov` atom is at the

@@ -197,6 +197,30 @@ func EncryptFile(inPath, outPath string, key []byte, chunkSize uint32) error {
 	return nil
 }
 
+// VerifyKey checks key against path by decrypting its first chunk.
+// It returns nil when the key is correct (or the file is empty and there
+// is nothing to check), and an error otherwise.
+func VerifyKey(path string, key []byte) error {
+	aead, err := newAEAD(key)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h, err := ReadHeader(f)
+	if err != nil {
+		return err
+	}
+	if h.ChunkCount() == 0 {
+		return nil
+	}
+	_, err = decryptChunkAt(f, aead, h, 0)
+	return err
+}
+
 // decryptChunkAt decrypts chunk index from open file f.
 func decryptChunkAt(f *os.File, aead cipher.AEAD, h Header, index int64) ([]byte, error) {
 	wantPlain := h.PlaintextLenOf(index)

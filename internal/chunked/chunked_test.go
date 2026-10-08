@@ -101,6 +101,33 @@ func TestTamperDetected(t *testing.T) {
 	}
 }
 
+func TestVerifyKey(t *testing.T) {
+	key := testKey(t)
+	data := make([]byte, 70<<10)
+	rand.Read(data)
+	dir := t.TempDir()
+	in, out := filepath.Join(dir, "i"), filepath.Join(dir, "o")
+	os.WriteFile(in, data, 0600)
+	if err := EncryptFile(in, out, key, 64<<10); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyKey(out, key); err != nil {
+		t.Fatalf("correct key rejected: %v", err)
+	}
+	if err := VerifyKey(out, testKey(t)); err == nil {
+		t.Fatal("wrong key accepted")
+	}
+	empty := filepath.Join(dir, "e")
+	os.WriteFile(empty, nil, 0600)
+	emptyOut := filepath.Join(dir, "eo")
+	if err := EncryptFile(empty, emptyOut, key, 64<<10); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyKey(emptyOut, testKey(t)); err != nil {
+		t.Fatalf("empty file should verify against any key: %v", err)
+	}
+}
+
 func TestWrongKey(t *testing.T) {
 	data := make([]byte, 70<<10)
 	rand.Read(data)
