@@ -34,7 +34,7 @@
     <span class="size" id="idle"></span>
   </div>
   <div id="list"></div>
-  <video id="v" controls preload="metadata" playsinline></video>
+  <video id="v" class="hidden" controls preload="metadata" playsinline></video>
 </div>
 
 <script>
@@ -64,6 +64,7 @@ async function refresh() {
     b.onclick = () => {
       document.querySelectorAll('#list button').forEach(x => x.classList.remove('active'));
       b.classList.add('active');
+      v.classList.remove('hidden');
       v.src = '/video/' + encodeURIComponent(it.name);
       v.play().catch(()=>{});
     };
@@ -83,7 +84,9 @@ $('unlockBtn').onclick = async () => {
 $('key').addEventListener('keydown', e => { if (e.key === 'Enter') $('unlockBtn').click(); });
 $('lockBtn').onclick = async () => {
   await fetch('/api/lock', {method: 'POST'});
+  document.querySelectorAll('#list button').forEach(x => x.classList.remove('active'));
   $('v').removeAttribute('src'); $('v').load();
+  $('v').classList.add('hidden');
   refresh();
 };
 refresh();
