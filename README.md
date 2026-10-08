@@ -29,6 +29,18 @@ New files appear on page refresh — no restart, no DB. Delete = `rm videos/x.ce
   (`--idle-lock 0` disables auto-lock).
 - A pasted key is checked against the library on unlock (typo → `401`).
 
+## Watch without a browser (mpv, no disk cache)
+
+```bash
+./scripts/run.sh              # terminal 1: server (locked or open)
+./scripts/watch.sh            # terminal 2: menu (unlock → list → play)
+./scripts/watch.sh moviename  # one-shot: play and exit
+```
+
+Needs `mpv` (`brew install mpv`). Key prompt hides input; `STREAM_KEY_HEX`
+env skips the prompt (scripting only). Player locks the server on quit —
+unless the server was already open, then it leaves it as found.
+
 ## Notes
 
 - If a video buffers instead of starting fast, its `moov` atom is at the
