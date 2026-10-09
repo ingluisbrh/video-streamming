@@ -6,3 +6,4 @@ incoming/*
 !incoming/.gitkeep
 *.tmp
 *.faststart.mp4
+.DS_Store
