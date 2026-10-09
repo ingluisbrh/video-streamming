@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os/exec"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestFindVideo(t *testing.T) {
@@ -94,5 +97,160 @@ func TestIPCFraming(t *testing.T) {
 	cmd := msg["command"].([]any)
 	if cmd[0].(string) != "set" || cmd[1].(string) != "x" {
 		t.Fatalf("bad frame: %s", line)
+	}
+}
+
+// liveInstance builds an mpvInstance whose IPC side answers every command
+// with success/42, like mpv does.
+func liveInstance() (*mpvInstance, func()) {
+	srv, cli := net.Pipe()
+	go func() {
+		r := bufio.NewReader(srv)
+		for {
+			if _, err := r.ReadString('\n'); err != nil {
+				return
+			}
+			if _, err := srv.Write([]byte("{\"error\":\"success\",\"data\":42}\n")); err != nil {
+				return
+			}
+		}
+	}()
+	m := &mpvInstance{
+		conn: &ipc{conn: cli, r: bufio.NewReader(cli)},
+		done: make(chan struct{}),
+	}
+	return m, func() { srv.Close(); cli.Close() }
+}
+
+// deadInstance simulates mpv after the window was closed: process reaped,
+// IPC socket gone (writes fail), no process handle left to kill.
+func deadInstance() *mpvInstance {
+	srv, cli := net.Pipe()
+	srv.Close()
+	done := make(chan struct{})
+	close(done)
+	return &mpvInstance{conn: &ipc{conn: cli, r: bufio.NewReader(cli)}, done: done}
+}
+
+func TestMPVCallRespawnsAfterWindowClose(t *testing.T) {
+	fresh, cleanup := liveInstance()
+	defer cleanup()
+	starts := 0
+	c := &mpvCtl{start: func() (*mpvInstance, error) {
+		starts++
+		return fresh, nil
+	}}
+	c.cur = deadInstance() // user closed the mpv window
+
+	got, err := c.call("loadfile", "http://x/v", "replace")
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if starts != 1 {
+		t.Fatalf("mpv starts = %d, want 1", starts)
+	}
+	if got != float64(42) {
+		t.Fatalf("data = %v, want 42", got)
+	}
+}
+
+func TestMPVCallRetriesWhenExitsMidCall(t *testing.T) {
+	// mpv reads the command, then dies before replying (window closed while
+	// the call was in flight); the reaper closes done right after.
+	srv, cli := net.Pipe()
+	m := &mpvInstance{conn: &ipc{conn: cli, r: bufio.NewReader(cli)}, done: make(chan struct{})}
+	go func() {
+		if _, err := bufio.NewReader(srv).ReadString('\n'); err == nil {
+			srv.Close()
+			close(m.done)
+		}
+	}()
+
+	fresh, cleanup := liveInstance()
+	defer cleanup()
+	starts := 0
+	c := &mpvCtl{start: func() (*mpvInstance, error) {
+		starts++
+		return fresh, nil
+	}}
+	c.cur = m
+
+	got, err := c.call("loadfile", "http://x/v", "replace")
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if starts != 1 {
+		t.Fatalf("mpv starts = %d, want 1", starts)
+	}
+	if got != float64(42) {
+		t.Fatalf("data = %v, want 42", got)
+	}
+}
+
+func TestMPVStopPlaybackNeverRespawns(t *testing.T) {
+	starts := 0
+	c := &mpvCtl{start: func() (*mpvInstance, error) {
+		starts++
+		t.Fatal("start() called for a dead mpv on 'stop'")
+		return nil, nil
+	}}
+	c.cur = deadInstance()
+	c.stopPlayback()
+	if starts != 0 {
+		t.Fatalf("mpv starts = %d, want 0", starts)
+	}
+}
+
+func TestMPVInstanceStopOnDeadIsNoop(t *testing.T) {
+	m := deadInstance()
+	done := make(chan struct{})
+	go func() { m.stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop() hung on an already-dead mpv (nil cmd)")
+	}
+	if m.alive() {
+		t.Fatal("dead instance reported alive")
+	}
+}
+
+// TestMPVRespawnsOnRealMPV reproduces the reported bug end-to-end: close the
+// mpv "window" (kill the process) and issue another play command.
+func TestMPVRespawnsOnRealMPV(t *testing.T) {
+	mpvPath, err := exec.LookPath("mpv")
+	if err != nil {
+		t.Skip("mpv not installed")
+	}
+	sock := filepath.Join(t.TempDir(), "ipc.sock")
+	starts := 0
+	start := func() (*mpvInstance, error) {
+		starts++
+		return startMPV(mpvPath, sock, []string{"--vo=null", "--ao=null"}, "Cookie: sess=test")
+	}
+	c := &mpvCtl{start: start}
+	if err := c.spawn(); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	defer c.stop()
+	first := c.cur
+
+	// The user closes the mpv window: the process exits and the socket dies.
+	if err := first.cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	if !first.waitDead(5 * time.Second) {
+		t.Fatal("mpv did not exit after kill")
+	}
+
+	// The next menu command must respawn mpv instead of hitting a dead pipe.
+	if _, err := c.call("get_property", "idle-active"); err != nil {
+		t.Fatalf("call after window close: %v", err)
+	}
+	if starts != 2 {
+		t.Fatalf("mpv starts = %d, want 2", starts)
+	}
+	if c.cur == first {
+		t.Fatal("mpv was not respawned")
 	}
 }

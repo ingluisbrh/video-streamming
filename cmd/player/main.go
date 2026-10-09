@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -335,40 +337,173 @@ func (c *ipc) call(args ...any) (any, error) {
 
 func (c *ipc) close() { c.conn.Close() }
 
-func interactive(c *http.Client, base, mpvPath string, extra []string, items []videoItem, weUnlocked bool) error {
-	sock := filepath.Join(os.TempDir(), fmt.Sprintf("stream-ipc-%d.sock", os.Getpid()))
-	os.Remove(sock)
+// exiting flips on when the player is on its way out (Ctrl-C) so a racing
+// menu command cannot respawn mpv in the last microseconds before exit.
+var exiting atomic.Bool
+
+// mpvInstance is one running mpv process plus its IPC connection. done is
+// closed as soon as the process has been reaped (window closed, quit, crash).
+type mpvInstance struct {
+	cmd  *exec.Cmd
+	conn *ipc
+	done chan struct{}
+}
+
+// startMPV spawns mpv in idle mode, connects to its IPC socket and installs
+// the session cookie as an mpv HTTP header (kept out of process arguments).
+func startMPV(mpvPath, sock string, extra []string, header string) (*mpvInstance, error) {
+	os.Remove(sock) // stale socket from a previous mpv
 	args := append([]string{"--idle=yes", "--input-ipc-server=" + sock, "--input-terminal=no"}, extra...)
 	cmd := exec.Command(mpvPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("mpv start: %w", err)
+		return nil, fmt.Errorf("mpv start: %w", err)
 	}
-	// quit tears down mpv and reports the first error seen.
-	quit := func() {
-		ipcConn, err := ipcConnect(sock)
-		if err == nil {
-			ipcConn.call("quit")
-			ipcConn.close()
-		}
-		cmd.Wait()
-	}
-	ipcConn, err := ipcConnect(sock)
+	m := &mpvInstance{cmd: cmd, done: make(chan struct{})}
+	go func() { cmd.Wait(); close(m.done) }()
+	conn, err := ipcConnect(sock)
 	if err != nil {
-		cmd.Process.Kill()
-		return err
-	}
-	cookie := sessCookie(c.Jar, base)
-	if cookie == "" {
-		ipcConn.close()
-		cmd.Process.Kill()
-		return fmt.Errorf("no session (server locked itself?) — restart player")
+		m.kill()
+		return nil, err
 	}
 	// http-header-fields is a "String list": set as one comma-separated string.
-	if _, err := ipcConn.call("set", "http-header-fields", "Cookie: sess="+cookie); err != nil {
-		ipcConn.close()
-		cmd.Process.Kill()
+	if _, err := conn.call("set", "http-header-fields", header); err != nil {
+		conn.close()
+		m.kill()
+		return nil, err
+	}
+	m.conn = conn
+	return m, nil
+}
+
+func (m *mpvInstance) alive() bool {
+	select {
+	case <-m.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// waitDead reports whether mpv exited within timeout.
+func (m *mpvInstance) waitDead(timeout time.Duration) bool {
+	select {
+	case <-m.done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// kill reaps mpv unconditionally; used only when startup failed halfway.
+func (m *mpvInstance) kill() {
+	m.cmd.Process.Kill()
+	<-m.done
+}
+
+// stop asks mpv to quit — a no-op if its window was already closed — and
+// waits for the process, killing it if it lingers.
+func (m *mpvInstance) stop() {
+	if m.alive() {
+		m.conn.call("quit") // error ignored: mpv may be exiting already
+	}
+	if !m.waitDead(3 * time.Second) {
+		m.cmd.Process.Kill()
+		m.waitDead(3 * time.Second)
+	}
+}
+
+// mpvCtl owns the mpv process behind the menu. Closing the mpv window quits
+// mpv, so commands go through call(), which transparently respawns mpv (and
+// reinstalls the cookie header) instead of writing to a dead socket.
+type mpvCtl struct {
+	mu    sync.Mutex
+	cur   *mpvInstance
+	start func() (*mpvInstance, error)
+}
+
+// spawn replaces the current mpv instance (stopping the old one first).
+func (c *mpvCtl) spawn() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.spawnLocked()
+}
+
+func (c *mpvCtl) spawnLocked() error {
+	if exiting.Load() {
+		return fmt.Errorf("player is exiting")
+	}
+	if c.cur != nil {
+		c.cur.stop()
+		c.cur.conn.close()
+		fmt.Println("mpv exited — reopening it")
+	}
+	m, err := c.start()
+	if err != nil {
+		return err
+	}
+	c.cur = m
+	return nil
+}
+
+// call sends a command, respawning mpv first if the window was closed and
+// retrying once if mpv dies mid-call.
+func (c *mpvCtl) call(args ...any) (any, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cur == nil || !c.cur.alive() {
+		if err := c.spawnLocked(); err != nil {
+			return nil, err
+		}
+	}
+	data, err := c.cur.conn.call(args...)
+	if err == nil {
+		return data, nil
+	}
+	// mpv may have exited between the check and the reply; give it a moment
+	// to be reaped, then restart and retry the command once.
+	if c.cur.waitDead(time.Second) {
+		if serr := c.spawnLocked(); serr != nil {
+			return nil, fmt.Errorf("%v (mpv restart: %v)", err, serr)
+		}
+		return c.cur.conn.call(args...)
+	}
+	return nil, err
+}
+
+// stopPlayback stops playback only while mpv is running — it never respawns.
+func (c *mpvCtl) stopPlayback() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cur != nil && c.cur.alive() {
+		c.cur.conn.call("stop")
+	}
+}
+
+// stop tears mpv down and waits for the process to exit.
+func (c *mpvCtl) stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cur == nil {
+		return
+	}
+	c.cur.stop()
+	c.cur.conn.close()
+	c.cur = nil
+}
+
+func interactive(c *http.Client, base, mpvPath string, extra []string, items []videoItem, weUnlocked bool) error {
+	cookie := sessCookie(c.Jar, base)
+	if cookie == "" {
+		return fmt.Errorf("no session (server locked itself?) — restart player")
+	}
+	header := "Cookie: sess=" + cookie
+	sock := filepath.Join(os.TempDir(), fmt.Sprintf("stream-ipc-%d.sock", os.Getpid()))
+	ctl := &mpvCtl{start: func() (*mpvInstance, error) {
+		return startMPV(mpvPath, sock, extra, header)
+	}}
+	if err := ctl.spawn(); err != nil {
 		return err
 	}
 
@@ -377,7 +512,8 @@ func interactive(c *http.Client, base, mpvPath string, extra []string, items []v
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
-		quit()
+		exiting.Store(true)
+		ctl.stop()
 		lockIfNeeded(c, base, weUnlocked)
 		fmt.Println("\nbye")
 		os.Exit(130)
@@ -397,8 +533,7 @@ func interactive(c *http.Client, base, mpvPath string, extra []string, items []v
 		}
 		switch fields[0] {
 		case "quit", "q", "exit":
-			quit()
-			ipcConn.close()
+			ctl.stop()
 			fmt.Println("bye")
 			return nil
 		case "list", "ls":
@@ -418,19 +553,19 @@ func interactive(c *http.Client, base, mpvPath string, extra []string, items []v
 				fmt.Println(err)
 				continue
 			}
-			if _, err := ipcConn.call("loadfile", base+"/video/"+url.PathEscape(it.Name), "replace"); err != nil {
+			// call() reopens mpv when its window was closed in between.
+			if _, err := ctl.call("loadfile", base+"/video/"+url.PathEscape(it.Name), "replace"); err != nil {
 				fmt.Println(err)
 				continue
 			}
 			fmt.Printf("playing %s\n", it.Name)
 		case "stop", "s":
-			ipcConn.call("stop")
+			ctl.stopPlayback()
 		case "lock":
 			lockReq, _ := http.NewRequest("POST", base+"/api/lock", nil)
 			c.Do(lockReq)
 			fmt.Println("locked — restart player to watch again")
-			quit()
-			ipcConn.close()
+			ctl.stop()
 			return nil
 		case "help", "h", "?":
 			fmt.Println("list | play <n|name> | stop | lock | quit")
@@ -438,8 +573,7 @@ func interactive(c *http.Client, base, mpvPath string, extra []string, items []v
 			fmt.Println("unknown: try list, play <n>, stop, lock, quit")
 		}
 	}
-	quit()
-	ipcConn.close()
+	ctl.stop()
 	return nil
 }
 
