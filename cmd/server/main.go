@@ -138,7 +138,7 @@ type Server struct {
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address (keep localhost)")
-	videosDir := flag.String("videos", "videos", "directory with *.cenc files")
+	videosDir := flag.String("videos", config.VideosDir(), "directory with *.cenc files (env VIDEOS_DIR)")
 	keyFile := flag.String("key-file", "", "path to keys.json (else env STREAM_KEY_HEX or ./keys.json)")
 	lockedAtStart := flag.Bool("locked-at-start", false, "boot locked even if a key is configured")
 	idleLock := flag.Int("idle-lock", 30, "auto-lock after N minutes without requests (0 disables)")

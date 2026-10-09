@@ -9,6 +9,7 @@
 ## Workflow (use wrappers, not raw binaries)
 
 - `./scripts/build.sh` → `bin/server`, `bin/encrypt`. `./scripts/keygen.sh` (respects `KEYFILE=`), `./scripts/add-video.sh IN.mp4 [name]`, `./scripts/migrate-old.sh OLD.enc [name]`, `./scripts/run.sh [port]`, `./scripts/check.sh <name>` (needs server running).
+- Video dir: `VIDEOS_DIR` env (default `videos`) is honored by `run.sh`, `add-video.sh`, `migrate-old.sh` and by the server's `--videos` default (`config.VideosDir()`); the `--videos` flag overrides the env. Dir is created by the add/migrate scripts if missing.
 - Key precedence (`internal/config/keys.go`): `--key-file` > `STREAM_KEY_HEX` env > `keys.json` > `config/keys.json`.
 
 ## Architecture

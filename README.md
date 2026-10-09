@@ -20,6 +20,23 @@ Key never leaves the server. Browser only sees `http://127.0.0.1:8080/video/<nam
 
 New files appear on page refresh — no restart, no DB. Delete = `rm videos/x.cenc`.
 
+## Store videos outside the repo (VIDEOS_DIR)
+
+Point everything at any folder — server, `add-video.sh` and `migrate-old.sh`
+all honor the same env var:
+
+```bash
+export VIDEOS_DIR=/mnt/secure/movies   # or ~/Private/videos, an external disk, ...
+./scripts/add-video.sh movie.mp4       # -> $VIDEOS_DIR/movie.cenc (dir auto-created)
+./scripts/run.sh                       # server serves $VIDEOS_DIR
+```
+
+- One-shot: `VIDEOS_DIR=/mnt/secure/movies ./scripts/run.sh`
+- Or flag only: `./bin/server --videos /mnt/secure/movies` (flag > env > `videos`).
+- The folder can live outside the repo; only `*.cenc` files are listed/served,
+  name allowlisting still applies — no path traversal. Keep `keys.json` safe:
+  the external folder holds ciphertext, but the key stays where it is.
+
 ## Key handling: unlock on watch
 
 - Default: key loads from `keys.json` at startup, no login needed.
