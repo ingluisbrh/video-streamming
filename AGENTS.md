@@ -8,7 +8,7 @@
 
 ## Workflow (use wrappers, not raw binaries)
 
-- `./scripts/build.sh` → `bin/server`, `bin/encrypt`. `./scripts/keygen.sh` (respects `KEYFILE=`), `./scripts/add-video.sh IN.mp4 [name]`, `./scripts/migrate-old.sh OLD.enc [name]`, `./scripts/run.sh [port]`, `./scripts/check.sh <name>` (needs server running).
+- `./scripts/build.sh` → `bin/server`, `bin/encrypt`. `./scripts/keygen.sh` (respects `KEYFILE=`), `./scripts/add-video.sh IN.mp4 [name]`, `./scripts/migrate-old.sh OLD.enc [name]`, `./scripts/decrypt.sh NAME [outdir]` (reverses `.cenc` → original, needs same key), `./scripts/run.sh [port]`, `./scripts/check.sh <name>` (needs server running).
 - Video dir: `VIDEOS_DIR` env (default `videos`) is honored by `run.sh`, `add-video.sh`, `migrate-old.sh` and by the server's `--videos` default (`config.VideosDir()`); the `--videos` flag overrides the env. Dir is created by the add/migrate scripts if missing.
 - Key precedence (`internal/config/keys.go`): `--key-file` > `STREAM_KEY_HEX` env > `keys.json` > `config/keys.json`.
 
@@ -19,7 +19,7 @@
 - `cmd/server` serves `web/index.html` from disk relative to cwd — always run from repo root. Single `Range` only; multipart/malformed → `416`. Names allowlisted to `[A-Za-z0-9][A-Za-z0-9._-]*` (traversal → 404). `GET /api/videos` re-reads the dir per request (no restart needed); corrupt/partial `.cenc` skipped silently.
 - Auth: `keyStore` (RAM-only key, `open` vs session mode, idle auto-lock). Boot with configured key → open mode (no cookie); `--locked-at-start` or no key → locked, unlock via `POST /api/unlock` (verified best-effort with `chunked.VerifyKey`). `/api/videos` + `/video/*` gated → `401` with `{"error":"locked"}`. Handlers snapshot the key via `use()` — never hold `ks.key` across calls. `wipeLocked` zeroes + sets `open=false`.
 - `cmd/player` (stdlib only, needs `mpv` binary): unlock → menu → drives mpv. Interactive mode passes the session cookie via IPC `set http-header-fields` (**string**, not array — "String list" type); one-shot `--play` passes it via argv (local `ps`-visible, documented in code). Menu owns mpv via `mpvCtl`: closing the mpv window quits mpv, so the next `play` respawns it (re-sets the header) instead of writing to a dead socket. Any post-unlock failure must go through `failf`/error returns so the session locks — never call bare `fatalf` after unlock. Ctrl-C handler locks too.
-- `cmd/encrypt` uses `O_EXCL` — refuses to overwrite; `EncryptFile` streams at ~chunkSize RAM, but `--migrate-old` holds full plaintext in RAM (one-time cost). `faststartStatus` is a pure-Go box scan (no ffmpeg here); `--fix-faststart` needs ffmpeg or only warns.
+- `cmd/encrypt` uses `O_EXCL` — refuses to overwrite; `EncryptFile` streams at ~chunkSize RAM, but `--migrate-old` holds full plaintext in RAM (one-time cost). `--decrypt` (`chunked.DecryptFile`) streams chunk-by-chunk back to the original and deletes the partial output on any auth failure. `faststartStatus` is a pure-Go box scan (no ffmpeg here); `--fix-faststart` needs ffmpeg or only warns.
 
 ## Constraints
 

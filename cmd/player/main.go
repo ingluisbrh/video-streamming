@@ -101,7 +101,7 @@ func main() {
 
 	// Menu loop works on pipes too; only the hidden key prompt needs a TTY
 	// (readSecret enforces that itself when STREAM_KEY_HEX is unset).
-	if err := interactive(httpc, base, mpvPath, extra, items, weUnlocked); err != nil {
+	if err := interactive(httpc, base, mpvPath, extra, items, weUnlocked, st.Open); err != nil {
 		failf("%v", err)
 	}
 	lockIfNeeded(httpc, base, weUnlocked)
@@ -278,9 +278,12 @@ func sessCookie(jar http.CookieJar, base string) string {
 // The cookie travels via argv here (visible in local `ps`); prefer
 // interactive mode, which uses IPC instead.
 func oneShot(c *http.Client, base, mpvPath string, extra []string, it videoItem) error {
-	args := append(append([]string{}, extra...),
-		"--http-header-fields=Cookie: sess="+sessCookie(c.Jar, base),
-		base+"/video/"+url.PathEscape(it.Name))
+	args := append([]string{}, extra...)
+	// Open mode has no session cookie; only attach one when we hold it.
+	if ck := sessCookie(c.Jar, base); ck != "" {
+		args = append(args, "--http-header-fields=Cookie: sess="+ck)
+	}
+	args = append(args, base+"/video/"+url.PathEscape(it.Name))
 	cmd := exec.Command(mpvPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -368,10 +371,13 @@ func startMPV(mpvPath, sock string, extra []string, header string) (*mpvInstance
 		return nil, err
 	}
 	// http-header-fields is a "String list": set as one comma-separated string.
-	if _, err := conn.call("set", "http-header-fields", header); err != nil {
-		conn.close()
-		m.kill()
-		return nil, err
+	// Empty header = open mode (no cookie); mpv needs none.
+	if header != "" {
+		if _, err := conn.call("set", "http-header-fields", header); err != nil {
+			conn.close()
+			m.kill()
+			return nil, err
+		}
 	}
 	m.conn = conn
 	return m, nil
@@ -493,12 +499,16 @@ func (c *mpvCtl) stop() {
 	c.cur = nil
 }
 
-func interactive(c *http.Client, base, mpvPath string, extra []string, items []videoItem, weUnlocked bool) error {
+func interactive(c *http.Client, base, mpvPath string, extra []string, items []videoItem, weUnlocked, open bool) error {
 	cookie := sessCookie(c.Jar, base)
-	if cookie == "" {
+	if cookie == "" && !open {
 		return fmt.Errorf("no session (server locked itself?) — restart player")
 	}
-	header := "Cookie: sess=" + cookie
+	// Open mode (server booted with key) needs no cookie; send one only if held.
+	header := ""
+	if cookie != "" {
+		header = "Cookie: sess=" + cookie
+	}
 	sock := filepath.Join(os.TempDir(), fmt.Sprintf("stream-ipc-%d.sock", os.Getpid()))
 	ctl := &mpvCtl{start: func() (*mpvInstance, error) {
 		return startMPV(mpvPath, sock, extra, header)

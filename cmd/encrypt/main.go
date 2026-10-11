@@ -5,6 +5,7 @@
 //	encrypt --gen-key --key-file keys.json
 //	encrypt --in movie.mp4 --out videos/movie.cenc
 //	encrypt --migrate-old --in movie.enc --out videos/movie.cenc
+//	encrypt --decrypt --in videos/movie.cenc --out movie.mp4
 package main
 
 import (
@@ -26,8 +27,9 @@ import (
 func main() {
 	genKey := flag.Bool("gen-key", false, "generate a new master key and exit")
 	migrateOld := flag.Bool("migrate-old", false, "decrypt legacy whole-file .enc (aes.go format) instead of raw mp4")
-	in := flag.String("in", "", "input file (.mp4, or legacy .enc with --migrate-old)")
-	out := flag.String("out", "", "output .cenc file")
+	decrypt := flag.Bool("decrypt", false, "decrypt a .cenc back to the original file instead of encrypting")
+	in := flag.String("in", "", "input file (.mp4, .cenc with --decrypt, or legacy .enc with --migrate-old)")
+	out := flag.String("out", "", "output file (.cenc when encrypting, original name when --decrypt)")
 	chunkSize := flag.Uint("chunk-size", chunked.DefaultChunkSize, "bytes per chunk")
 	keyFile := flag.String("key-file", "", "keys.json path (else env STREAM_KEY_HEX or ./keys.json)")
 	fixFaststart := flag.Bool("fix-faststart", false, "if ffmpeg exists and moov is at end, remake with +faststart first")
@@ -49,11 +51,23 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if *decrypt && *migrateOld {
+		log.Fatal("--decrypt and --migrate-old are mutually exclusive")
+	}
 	key, src, err := config.LoadKey(*keyFile)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("key from %s", src)
+
+	if *decrypt {
+		if err := chunked.DecryptFile(*in, *out, key); err != nil {
+			log.Fatalf("decrypt failed (wrong key or corrupt file?): %v", err)
+		}
+		st, _ := os.Stat(*out)
+		fmt.Printf("wrote %s (%d bytes decrypted)\n", *out, st.Size())
+		return
+	}
 
 	srcPath := *in
 	if !*migrateOld && strings.HasSuffix(strings.ToLower(srcPath), ".mp4") {

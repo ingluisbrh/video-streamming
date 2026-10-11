@@ -145,3 +145,67 @@ func TestWrongKey(t *testing.T) {
 		t.Fatal("expected auth failure with wrong key")
 	}
 }
+
+func TestDecryptRoundTrip(t *testing.T) {
+	sizes := []int{0, 1, 1000, 64 << 10, (64 << 10) + 1, 300 << 10}
+	key := testKey(t)
+	for _, n := range sizes {
+		data := make([]byte, n)
+		rand.Read(data)
+		dir := t.TempDir()
+		in, enc := filepath.Join(dir, "i"), filepath.Join(dir, "o.cenc")
+		dec := filepath.Join(dir, "o.mp4")
+		os.WriteFile(in, data, 0600)
+		if err := EncryptFile(in, enc, key, 64<<10); err != nil {
+			t.Fatal(err)
+		}
+		if err := DecryptFile(enc, dec, key); err != nil {
+			t.Fatalf("size %d: %v", n, err)
+		}
+		got, err := os.ReadFile(dec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("size %d: decrypt mismatch", n)
+		}
+	}
+}
+
+func TestDecryptWrongKeyLeavesNoOutput(t *testing.T) {
+	data := make([]byte, 200<<10) // several chunks; fail must abort mid-way
+	rand.Read(data)
+	dir := t.TempDir()
+	in, enc := filepath.Join(dir, "i"), filepath.Join(dir, "o.cenc")
+	dec := filepath.Join(dir, "o.mp4")
+	os.WriteFile(in, data, 0600)
+	if err := EncryptFile(in, enc, testKey(t), 64<<10); err != nil {
+		t.Fatal(err)
+	}
+	if err := DecryptFile(enc, dec, testKey(t)); err == nil {
+		t.Fatal("expected failure with wrong key")
+	}
+	if _, err := os.Stat(dec); !os.IsNotExist(err) {
+		t.Fatal("partial output left behind after failed decrypt")
+	}
+}
+
+func TestDecryptRefusesOverwrite(t *testing.T) {
+	data := make([]byte, 1000)
+	rand.Read(data)
+	dir := t.TempDir()
+	in, enc := filepath.Join(dir, "i"), filepath.Join(dir, "o.cenc")
+	dec := filepath.Join(dir, "o.mp4")
+	os.WriteFile(in, data, 0600)
+	os.WriteFile(dec, []byte("precious"), 0600)
+	if err := EncryptFile(in, enc, testKey(t), 64<<10); err != nil {
+		t.Fatal(err)
+	}
+	if err := DecryptFile(enc, dec, testKey(t)); err == nil {
+		t.Fatal("expected refusal to overwrite existing output")
+	}
+	got, _ := os.ReadFile(dec)
+	if string(got) != "precious" {
+		t.Fatal("existing output was modified")
+	}
+}
