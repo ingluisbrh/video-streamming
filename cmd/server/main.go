@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -132,6 +134,7 @@ func (k *keyStore) wipeLocked() {
 
 type Server struct {
 	videosDir string
+	imagesDir string
 	ks        *keyStore
 	idleMin   int
 }
@@ -139,6 +142,7 @@ type Server struct {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address (keep localhost)")
 	videosDir := flag.String("videos", config.VideosDir(), "directory with *.cenc files (env VIDEOS_DIR)")
+	imagesDir := flag.String("images", config.ImagesDir(), "directory with *.cenc images (env IMAGES_DIR)")
 	keyFile := flag.String("key-file", "", "path to keys.json (else env STREAM_KEY_HEX or ./keys.json)")
 	lockedAtStart := flag.Bool("locked-at-start", false, "boot locked even if a key is configured")
 	idleLock := flag.Int("idle-lock", 30, "auto-lock after N minutes without requests (0 disables)")
@@ -162,18 +166,28 @@ func main() {
 		log.Print("starting LOCKED (--locked-at-start)")
 	}
 
-	s := &Server{videosDir: *videosDir, ks: ks, idleMin: *idleLock}
+	s := &Server{videosDir: *videosDir, imagesDir: *imagesDir, ks: ks, idleMin: *idleLock}
+	mux := newMux(s)
+
+	log.Printf("serving videos from %s, images from %s on http://%s", *videosDir, *imagesDir, *addr)
+	log.Fatal(http.ListenAndServe(*addr, mux))
+}
+
+// newMux registers every route. Shared by main and the tests so they can
+// never drift apart.
+func newMux(s *Server) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/unlock", s.handleUnlock)
 	mux.HandleFunc("POST /api/lock", s.handleLock)
 	mux.HandleFunc("GET /api/videos", s.handleList)
+	mux.HandleFunc("GET /api/images", s.handleListImages)
 	mux.HandleFunc("GET /video/{name}", s.handleVideo)
 	mux.HandleFunc("HEAD /video/{name}", s.handleVideo)
+	mux.HandleFunc("GET /image/{name}", s.handleImage)
+	mux.HandleFunc("HEAD /image/{name}", s.handleImage)
 	mux.HandleFunc("GET /", s.handleIndex)
-
-	log.Printf("serving %s on http://%s", *videosDir, *addr)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	return mux
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -203,7 +217,7 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Best-effort check against the library so typos fail fast.
-	if first, ok := s.firstVideo(); ok {
+	if first, ok := s.firstCenc(); ok {
 		if err := chunked.VerifyKey(first, key); err != nil {
 			for i := range key {
 				key[i] = 0
@@ -234,15 +248,21 @@ func (s *Server) handleLock(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-// firstVideo returns the path of any .cenc file, for unlock verification.
-func (s *Server) firstVideo() (string, bool) {
-	entries, err := os.ReadDir(s.videosDir)
-	if err != nil {
-		return "", false
-	}
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".cenc") {
-			return filepath.Join(s.videosDir, e.Name()), true
+// firstCenc returns the path of any .cenc (videos first, then images), for
+// unlock verification.
+func (s *Server) firstCenc() (string, bool) {
+	for _, dir := range []string{s.videosDir, s.imagesDir} {
+		if dir == "" {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".cenc") {
+				return filepath.Join(dir, e.Name()), true
+			}
 		}
 	}
 	return "", false
@@ -277,12 +297,15 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-func (s *Server) resolve(name string) (string, bool) {
+// resolveIn maps a URL name to a .cenc path inside dir, enforcing the name
+// allowlist (traversal-proof). The name may carry an extension, e.g.
+// "photo.jpg" -> dir/photo.jpg.cenc.
+func resolveIn(dir, name string) (string, bool) {
 	base := strings.TrimSuffix(name, ".cenc")
 	if !safeName.MatchString(base) {
 		return "", false
 	}
-	p := filepath.Join(s.videosDir, base+".cenc")
+	p := filepath.Join(dir, base+".cenc")
 	st, err := os.Stat(p)
 	if err != nil || st.IsDir() {
 		return "", false
@@ -290,25 +313,30 @@ func (s *Server) resolve(name string) (string, bool) {
 	return p, true
 }
 
-func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	if s.requireAuth(w, r) == nil {
-		return
-	}
-	entries, err := os.ReadDir(s.videosDir)
+func (s *Server) resolve(name string) (string, bool) {
+	return resolveIn(s.videosDir, name)
+}
+
+// cencItem is one entry of /api/videos and /api/images.
+type cencItem struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"` // plaintext bytes
+}
+
+// listCenc returns every readable .cenc in dir with its plaintext size.
+// Corrupt/partial files are skipped silently (they may still be being
+// written by encrypt).
+func listCenc(dir string) ([]cencItem, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		http.Error(w, "videos dir unreadable", 500)
-		return
+		return nil, err
 	}
-	type item struct {
-		Name string `json:"name"`
-		Size int64  `json:"size"` // plaintext bytes
-	}
-	out := []item{}
+	out := []cencItem{}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".cenc") {
 			continue
 		}
-		p := filepath.Join(s.videosDir, e.Name())
+		p := filepath.Join(dir, e.Name())
 		f, err := os.Open(p)
 		if err != nil {
 			continue
@@ -318,10 +346,30 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue // skip partial/corrupt files being written
 		}
-		out = append(out, item{Name: strings.TrimSuffix(e.Name(), ".cenc"), Size: int64(h.PlaintextSize)})
+		out = append(out, cencItem{Name: strings.TrimSuffix(e.Name(), ".cenc"), Size: int64(h.PlaintextSize)})
+	}
+	return out, nil
+}
+
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	s.serveList(w, r, s.videosDir)
+}
+
+func (s *Server) handleListImages(w http.ResponseWriter, r *http.Request) {
+	s.serveList(w, r, s.imagesDir)
+}
+
+func (s *Server) serveList(w http.ResponseWriter, r *http.Request, dir string) {
+	if s.requireAuth(w, r) == nil {
+		return
+	}
+	items, err := listCenc(dir)
+	if err != nil {
+		http.Error(w, "media dir unreadable", 500)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(out)
+	json.NewEncoder(w).Encode(items)
 }
 
 // parseRange handles "bytes=start-", "bytes=start-end", "bytes=-suffix" (single range).
@@ -377,6 +425,35 @@ func (s *Server) handleVideo(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	s.serveCenc(w, r, p, "video/mp4", key)
+}
+
+// handleImage serves a decrypted image with a sniffed Content-Type. The
+// browser renders it straight from <img src> — it only ever sees plaintext
+// bytes the server chose to release.
+func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
+	key := s.requireAuth(w, r)
+	if key == nil {
+		return
+	}
+	name := r.PathValue("name")
+	p, ok := resolveIn(s.imagesDir, name)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	ct, err := s.imageContentType(p, name, key)
+	if err != nil {
+		log.Printf("sniff %s: %v", p, err)
+		http.Error(w, "corrupt image file", http.StatusInternalServerError)
+		return
+	}
+	s.serveCenc(w, r, p, ct, key)
+}
+
+// serveCenc decrypts the .cenc at path and writes the plaintext to w with
+// contentType, honoring a single HTTP Range (same code path videos use).
+func (s *Server) serveCenc(w http.ResponseWriter, r *http.Request, p, contentType string, key []byte) {
 	f, err := os.Open(p)
 	if err != nil {
 		http.NotFound(w, r)
@@ -385,11 +462,11 @@ func (s *Server) handleVideo(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 	h, err := chunked.ReadHeader(f)
 	if err != nil {
-		http.Error(w, "corrupt video file", 500)
+		http.Error(w, "corrupt file", http.StatusInternalServerError)
 		return
 	}
 	size := int64(h.PlaintextSize)
-	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	if r.Method == http.MethodHead {
@@ -417,4 +494,70 @@ func (s *Server) handleVideo(w http.ResponseWriter, r *http.Request) {
 	if err := chunked.StreamRange(w, f, h, key, start, end); err != nil {
 		log.Printf("range %s %d-%d: %v", p, start, end, err)
 	}
+}
+
+// sniffHead is how many plaintext bytes imageContentType inspects.
+const sniffHead = 512
+
+// imageContentType decides the Content-Type for an encrypted image: sniff the
+// first plaintext bytes, then fall back to the stored filename extension
+// (e.g. photo.webp.cenc), then to application/octet-stream.
+func (s *Server) imageContentType(path, name string, key []byte) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h, err := chunked.ReadHeader(f)
+	if err != nil {
+		return "", err
+	}
+	if h.PlaintextSize == 0 {
+		return "application/octet-stream", nil
+	}
+	n := int64(sniffHead)
+	if n > int64(h.PlaintextSize) {
+		n = int64(h.PlaintextSize)
+	}
+	var buf bytes.Buffer
+	if err := chunked.StreamRange(&buf, f, h, key, 0, n-1); err != nil {
+		return "", err
+	}
+	if ct := sniffImage(buf.Bytes()); ct != "" {
+		return ct, nil
+	}
+	if ext := filepath.Ext(strings.TrimSuffix(name, ".cenc")); ext != "" {
+		if ct := mime.TypeByExtension(strings.ToLower(ext)); ct != "" {
+			return ct, nil
+		}
+	}
+	return "application/octet-stream", nil
+}
+
+// sniffImage maps image magic numbers to a MIME type, or "" when b does not
+// start with a format we recognize. Kept explicit rather than relying on
+// http.DetectContentType so every supported format is a test case.
+func sniffImage(b []byte) string {
+	jpeg := []byte{0xFF, 0xD8, 0xFF}
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'}
+	switch {
+	case len(b) >= len(jpeg) && bytes.Equal(b[:len(jpeg)], jpeg):
+		return "image/jpeg"
+	case len(b) >= len(png) && bytes.Equal(b[:len(png)], png):
+		return "image/png"
+	case len(b) >= 6 && (bytes.Equal(b[:6], []byte("GIF87a")) || bytes.Equal(b[:6], []byte("GIF89a"))):
+		return "image/gif"
+	case len(b) >= 12 && bytes.Equal(b[:4], []byte("RIFF")) && bytes.Equal(b[8:12], []byte("WEBP")):
+		return "image/webp"
+	case len(b) >= 12 && bytes.Equal(b[4:8], []byte("ftyp")):
+		switch string(b[8:12]) {
+		case "avif", "avis":
+			return "image/avif"
+		case "heic", "heix", "hevc", "hevx", "mif1", "msf1":
+			return "image/heif"
+		}
+	case len(b) >= 2 && b[0] == 'B' && b[1] == 'M':
+		return "image/bmp"
+	}
+	return ""
 }

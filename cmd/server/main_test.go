@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,17 +34,25 @@ func fixture(t *testing.T) (*Server, []byte, string) {
 	if err := chunked.EncryptFile(in, filepath.Join(dir, "vid.cenc"), key, 64<<10); err != nil {
 		t.Fatal(err)
 	}
-	return &Server{videosDir: dir, ks: &keyStore{}}, key, "vid"
+	return &Server{videosDir: dir, imagesDir: t.TempDir(), ks: &keyStore{}}, key, "vid"
 }
 
+// buildImage encrypts plain into s.imagesDir/<name>.cenc.
+func buildImage(t *testing.T, s *Server, key []byte, name string, plain []byte) {
+	t.Helper()
+	in := filepath.Join(s.imagesDir, "raw.bin")
+	if err := os.WriteFile(in, plain, 0600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(in)
+	if err := chunked.EncryptFile(in, filepath.Join(s.imagesDir, name+".cenc"), key, 64<<10); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mux is the real route table, so tests can never drift from main.
 func mux(s *Server) *http.ServeMux {
-	m := http.NewServeMux()
-	m.HandleFunc("GET /api/status", s.handleStatus)
-	m.HandleFunc("POST /api/unlock", s.handleUnlock)
-	m.HandleFunc("POST /api/lock", s.handleLock)
-	m.HandleFunc("GET /api/videos", s.handleList)
-	m.HandleFunc("GET /video/{name}", s.handleVideo)
-	return m
+	return newMux(s)
 }
 
 func TestLockUnlockFlow(t *testing.T) {
@@ -135,6 +145,152 @@ func TestIdleAutoLock(t *testing.T) {
 	}
 	if body := get(t, m, "/api/status", ""); !strings.Contains(body, `"locked":true`) {
 		t.Fatalf("expected re-locked status, got %s", body)
+	}
+}
+
+func TestSniffImage(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		{"jpeg", []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00}, "image/jpeg"},
+		{"png", []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'}, "image/png"},
+		{"gif87a", []byte("GIF87a..."), "image/gif"},
+		{"gif89a", []byte("GIF89a..."), "image/gif"},
+		{"webp", []byte("RIFF\x24\x00\x00\x00WEBPVP8 "), "image/webp"},
+		{"avif", []byte("\x00\x00\x00\x20ftypavif"), "image/avif"},
+		{"heif", []byte("\x00\x00\x00\x20ftypmif1"), "image/heif"},
+		{"bmp", []byte("BM\x36\x00\x00\x00"), "image/bmp"},
+		{"unknown ftyp brand", []byte("\x00\x00\x00\x20ftypmp42"), ""},
+		{"text", []byte("hello world"), ""},
+		{"empty", nil, ""},
+		{"jpeg truncated", []byte{0xFF, 0xD8}, ""},
+		{"png truncated", []byte{0x89, 'P'}, ""},
+		{"webp truncated", []byte("RIFF\x00\x00\x00\x00WE"), ""},
+		{"ftyp brand truncated", []byte("\x00\x00\x00\x20ftypav"), ""},
+	}
+	for _, c := range cases {
+		if got := sniffImage(c.in); got != c.want {
+			t.Errorf("sniffImage(%s) = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestImageServe(t *testing.T) {
+	s, key, _ := fixture(t)
+	m := mux(s)
+
+	jpeg := make([]byte, 4096)
+	copy(jpeg, []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01})
+	rand.Read(jpeg[12:])
+	buildImage(t, s, key, "photo.jpg", jpeg)
+
+	// Locked: both list and bytes are refused.
+	if code := getCode(t, m, "/api/images", ""); code != 401 {
+		t.Fatalf("images while locked = %d, want 401", code)
+	}
+	if code := getCode(t, m, "/image/photo.jpg", ""); code != 401 {
+		t.Fatalf("image while locked = %d, want 401", code)
+	}
+
+	// Unlocked (open mode).
+	s.ks.unlock(key)
+	s.ks.open = true
+
+	list := get(t, m, "/api/images", "")
+	var items []cencItem
+	if err := json.Unmarshal([]byte(list), &items); err != nil || len(items) != 1 {
+		t.Fatalf("images list = %s, %v", list, err)
+	}
+	if items[0].Name != "photo.jpg" || items[0].Size != int64(len(jpeg)) {
+		t.Fatalf("item = %+v, want photo.jpg/%d", items[0], len(jpeg))
+	}
+	if body := get(t, m, "/api/videos", ""); strings.Contains(body, "photo.jpg") {
+		t.Fatalf("video list leaked an image: %s", body)
+	}
+
+	// Full fetch: correct Content-Type and byte-identical plaintext.
+	req := httptest.NewRequest("GET", "/image/photo.jpg", nil)
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("GET image = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("content-type = %q, want image/jpeg", ct)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), jpeg) {
+		t.Fatalf("plaintext differs from original (got %d bytes, want %d)", rec.Body.Len(), len(jpeg))
+	}
+
+	// Range still works on images.
+	rng := httptest.NewRequest("GET", "/image/photo.jpg", nil)
+	rng.Header.Set("Range", "bytes=0-3")
+	rrec := httptest.NewRecorder()
+	m.ServeHTTP(rrec, rng)
+	if rrec.Code != 206 || !bytes.Equal(rrec.Body.Bytes(), jpeg[:4]) {
+		t.Fatalf("range = %d %x, want 206 %x", rrec.Code, rrec.Body.Bytes(), jpeg[:4])
+	}
+
+	// HEAD reports size with no body.
+	head := httptest.NewRequest("HEAD", "/image/photo.jpg", nil)
+	hrec := httptest.NewRecorder()
+	m.ServeHTTP(hrec, head)
+	if hrec.Code != 200 || hrec.Body.Len() != 0 {
+		t.Fatalf("HEAD = %d len %d, want 200/0", hrec.Code, hrec.Body.Len())
+	}
+	if cl := hrec.Header().Get("Content-Length"); cl != strconv.Itoa(len(jpeg)) {
+		t.Fatalf("HEAD content-length = %q, want %d", cl, len(jpeg))
+	}
+
+	// Unknown names never escape the images dir.
+	if code := getCode(t, m, "/image/..%2f..%2fkeys", ""); code != 404 {
+		t.Fatalf("traversal = %d, want 404", code)
+	}
+}
+
+func TestImageContentTypeFallsBackToExtension(t *testing.T) {
+	s, key, _ := fixture(t)
+	// Plaintext with no recognized magic: the stored extension decides.
+	plain := []byte("plain text with no image signature at all")
+	buildImage(t, s, key, "note.png", plain)
+	got, err := s.imageContentType(filepath.Join(s.imagesDir, "note.png.cenc"), "note.png", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "image/png" {
+		t.Fatalf("content-type = %q, want image/png", got)
+	}
+}
+
+func TestListRequiresAuthForImages(t *testing.T) {
+	s, key, _ := fixture(t)
+	m := mux(s)
+	buildImage(t, s, key, "a.jpg", []byte{0xFF, 0xD8, 0xFF, 0x00})
+	if code := getCode(t, m, "/api/images", ""); code != 401 {
+		t.Fatalf("images locked = %d, want 401", code)
+	}
+	cookie := postUnlock(t, m, hex.EncodeToString(key))
+	if code := getCode(t, m, "/api/images", cookie); code != 200 {
+		t.Fatalf("images unlocked = %d, want 200", code)
+	}
+}
+
+func TestUnlockVerifiesAgainstImages(t *testing.T) {
+	// No videos at all: unlock must still verify the key — against an image.
+	s, key, _ := fixture(t)
+	s.videosDir = t.TempDir() // empty, so firstCenc() finds only the image
+	m := mux(s)
+	buildImage(t, s, key, "a.jpg", []byte{0xFF, 0xD8, 0xFF, 0x00})
+
+	if code := postJSON(t, m, "/api/unlock", `{"keyHex":"`+hex.EncodeToString(key)+`"}`, ""); code != 200 {
+		t.Fatalf("unlock with image-only library = %d, want 200", code)
+	}
+	wrong := make([]byte, 32)
+	rand.Read(wrong)
+	if code := postJSON(t, m, "/api/unlock", `{"keyHex":"`+hex.EncodeToString(wrong)+`"}`, ""); code != 401 {
+		t.Fatalf("wrong key vs image-only library = %d, want 401", code)
 	}
 }
 

@@ -20,6 +20,31 @@ Key never leaves the server. Browser only sees `http://127.0.0.1:8080/video/<nam
 
 New files appear on page refresh — no restart, no DB. Delete = `rm videos/x.cenc`.
 
+## Add images (same format, shown in the browser)
+
+Images use the exact same `.cenc` encryption — they just live in their own
+folder and get their own endpoint:
+
+```bash
+./scripts/add-image.sh photo.jpg            # -> images/photo.jpg.cenc
+./scripts/add-image.sh scan.png logo        # custom name
+IMAGES_DIR=/mnt/secure/pics ./scripts/add-image.sh photo.jpg
+```
+
+Open the page: videos keep their buttons, images appear as a thumbnail grid
+below — click one for the full-size view (Esc or click to close).
+
+- Served by `GET /image/<name>`, gated exactly like `/video/<name>`: `401`
+  while locked, session cookie otherwise. The browser only ever receives
+  decrypted bytes.
+- The `Content-Type` is sniffed from the plaintext magic bytes
+  (JPEG/PNG/GIF/WebP/AVIF/HEIF/BMP), falling back to the file extension —
+  so a name with no extension (`add-image.sh scan.png logo`) still shows
+  correctly as `image/png`.
+- Unlocking is verified against *any* `.cenc`, so a library of images alone
+  still works for the paste-the-key flow.
+- `--images` flag > `IMAGES_DIR` env > `images/`.
+
 ## Store videos outside the repo (VIDEOS_DIR)
 
 Point everything at any folder — server, `add-video.sh` and `migrate-old.sh`
