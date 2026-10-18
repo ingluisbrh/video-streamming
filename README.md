@@ -71,17 +71,37 @@ export VIDEOS_DIR=/mnt/secure/movies   # or ~/Private/videos, an external disk, 
   (`--idle-lock 0` disables auto-lock).
 - A pasted key is checked against the library on unlock (typo → `401`).
 
-## Watch without a browser (mpv, no disk cache)
+## Watch without a browser (terminal UI, mpv, no disk cache)
 
 ```bash
 ./scripts/run.sh              # terminal 1: server (locked or open)
-./scripts/watch.sh            # terminal 2: menu (unlock → list → play)
-./scripts/watch.sh moviename  # one-shot: play and exit
+./scripts/watch.sh            # terminal 2: full-screen player (unlock → browse → play)
+./scripts/watch.sh moviename  # one-shot: play a video and exit
 ```
 
-Needs `mpv` (`brew install mpv`). Key prompt hides input; `STREAM_KEY_HEX`
-env skips the prompt (scripting only). Player locks the server on quit —
-unless the server was already open, then it leaves it as found.
+`watch.sh` opens a full-screen terminal UI listing **videos and images**
+(type to filter, arrows to move):
+
+```
+↑/↓ move · / filter · enter play · space pause · s stop · t terminal/window · r refresh · q quit
+```
+
+- **Enter** plays the selection. `space` pauses/resumes and `s` stops;
+  the status bar shows a live progress bar polled from mpv over IPC.
+- **`t`** toggles where video renders: mpv's own window (default) or the
+  current terminal via mpv's `--vo=tct`. In terminal mode mpv owns the
+  keyboard for that item — press `q` inside mpv to return to the list.
+- Images are shown by mpv too (they stay on screen until you play something
+  else or quit).
+- **`r`** re-reads the library (no restart); **`q`** quits and locks.
+
+Needs `mpv` (`brew install mpv`). The UI needs a real terminal — for pipes
+and scripts use `./scripts/watch.sh NAME` (one-shot). Key prompt hides input;
+`STREAM_KEY_HEX` skips the prompt (scripting only). The session cookie is
+handed to mpv over its IPC socket, so it never shows up in `ps` — the
+one-shot path passes it in argv instead (local user only). Player locks the
+server on quit — unless the server was already open, then it leaves it as
+found.
 
 ## Notes
 

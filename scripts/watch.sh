@@ -1,6 +1,6 @@
 #!/bin/bash
 # Watch without a browser: ./scripts/watch.sh [name]
-# Menu mode by default; with a name it plays once and exits.
+# Full-screen terminal UI by default; with a name it plays once and exits.
 # Needs mpv (brew install mpv) and the server running (./scripts/run.sh).
 set -euo pipefail
 cd "$(dirname "$0")/.."

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -14,7 +15,7 @@ import (
 )
 
 func TestFindVideo(t *testing.T) {
-	items := []videoItem{{Name: "a", Size: 1}, {Name: "b c", Size: 2}}
+	items := []mediaItem{{Name: "a", Size: 1}, {Name: "b c", Size: 2}}
 	if it, err := findVideo(items, "1"); err != nil || it.Name != "a" {
 		t.Fatalf("index: %v %v", it, err)
 	}
@@ -97,6 +98,31 @@ func TestIPCFraming(t *testing.T) {
 	cmd := msg["command"].([]any)
 	if cmd[0].(string) != "set" || cmd[1].(string) != "x" {
 		t.Fatalf("bad frame: %s", line)
+	}
+}
+
+// TestIPCSkipsEvents reproduces the poll-loop bug: mpv interleaves
+// {"event":...} objects with command replies, and call must skip them instead
+// of mistaking an event for a failed reply.
+func TestIPCSkipsEvents(t *testing.T) {
+	srv, cli := net.Pipe()
+	defer srv.Close()
+	defer cli.Close()
+	go func() {
+		line, _ := bufio.NewReader(srv).ReadString('\n')
+		var msg map[string]any
+		json.Unmarshal([]byte(line), &msg)
+		id := int(msg["request_id"].(float64))
+		srv.Write([]byte("{\"event\":\"file-loaded\"}\n"))
+		srv.Write([]byte(fmt.Sprintf("{\"error\":\"success\",\"data\":7,\"request_id\":%d}\n", id)))
+	}()
+	c := &ipc{conn: cli, r: bufio.NewReader(cli)}
+	v, err := c.call("get_property", "duration")
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if v != float64(7) {
+		t.Fatalf("data = %v, want 7", v)
 	}
 }
 
