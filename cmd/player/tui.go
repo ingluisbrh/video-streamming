@@ -185,14 +185,9 @@ func (m model) View() tea.View {
 }
 
 func (m *model) resize() {
-	h := m.height - 2 // reserve the status + help lines
-	if h < 3 {
-		h = 3
-	}
-	w := m.width
-	if w < 10 {
-		w = 10
-	}
+	// reserve the status + help lines
+	h := max(m.height-2, 3)
+	w := max(m.width, 10)
 	m.list.SetSize(w, h)
 	m.bar.SetWidth(min(w-40, 44))
 }

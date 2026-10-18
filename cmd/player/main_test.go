@@ -114,7 +114,8 @@ func TestIPCSkipsEvents(t *testing.T) {
 		json.Unmarshal([]byte(line), &msg)
 		id := int(msg["request_id"].(float64))
 		srv.Write([]byte("{\"event\":\"file-loaded\"}\n"))
-		srv.Write([]byte(fmt.Sprintf("{\"error\":\"success\",\"data\":7,\"request_id\":%d}\n", id)))
+		result_json := fmt.Sprintf("{\"error\":\"success\",\"data\":7,\"request_id\":%d}\n", id)
+		srv.Write([]byte(result_json))
 	}()
 	c := &ipc{conn: cli, r: bufio.NewReader(cli)}
 	v, err := c.call("get_property", "duration")

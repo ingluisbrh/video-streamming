@@ -31,7 +31,7 @@ func TestToListItemsPreservesFilterValues(t *testing.T) {
 	if len(items) != 2 {
 		t.Fatalf("len = %d", len(items))
 	}
-	if items[0].(list.Item).FilterValue() != "a" || items[1].FilterValue() != "b" {
+	if items[0].FilterValue() != "a" || items[1].FilterValue() != "b" {
 		t.Fatalf("filter values lost: %v", items)
 	}
 }
